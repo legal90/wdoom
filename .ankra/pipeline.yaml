@@ -1,0 +1,98 @@
+# Ankra pipeline.
+# Ankra runs this pipeline in your own cluster on every push, pull request and
+# schedule it declares. Stages run as hardened Jobs sharing one workspace;
+# ${{ … }} expressions are resolved per run. Edit it here - Git is the source
+# of truth, and the definition on the default branch governs authority.
+apiVersion: ankra.io/v1
+kind: Pipeline
+metadata:
+  name: "room"
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    branches:
+      - "main"
+    fork_policy: "read_only"
+  manual: {}
+concurrency:
+  group: "${{ ankra.repository.provider }}:${{ ankra.repository.owner }}/${{ ankra.repository.name }}-${{ ankra.ref }}"
+  cancel_in_progress: true
+workspace:
+  size: "10Gi"
+  access: "rwo"
+defaults:
+  timeout: "30m"
+  network: "egress-https"
+permissions:
+  contents: "read"
+stages:
+  - name: "checkout"
+    kind: "checkout"
+  - name: "test"
+    kind: "run"
+    image: "rust:1"
+    run: "cargo test --locked"
+    needs:
+      - "checkout"
+    env:
+      CARGO_HOME: "/workspace/.ankra-cargo/home"
+      CARGO_TARGET_DIR: "/workspace/.ankra-cargo/target"
+    cache:
+      - key: "cargo-registry-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}"
+        paths:
+          - ".ankra-cargo/home/registry"
+          - ".ankra-cargo/home/git"
+        restore_keys:
+          - "cargo-registry-"
+        fallback: "none"
+      - key: "cargo-target-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}"
+        paths:
+          - ".ankra-cargo/target"
+        restore_keys:
+          - "cargo-target-"
+        fallback: "none"
+  - name: "build"
+    kind: "build"
+    needs:
+      - "test"
+    network: "egress-https"
+    build:
+      provenance: true
+      sbom: true
+  - name: "scan"
+    kind: "scan"
+    with:
+      image_gate: "app"
+      semgrep_config: "p/default p/docker p/github-actions p/rust"
+    needs:
+      - "build"
+    network: "egress-https"
+    scan:
+      scanners:
+        - "semgrep"
+        - "checkov"
+        - "trivy"
+      fail_on:
+        checkov: "none"
+        semgrep: "error"
+        trivy: "app"
+  - name: "gate"
+    kind: "gate"
+    needs:
+      - "scan"
+    gate:
+      require_stages:
+        - "scan"
+  - name: "publish"
+    kind: "publish"
+    with:
+      image: "registry.ankra.cloud/org-4ee02739-2825-4c25-8a91-d2b449c9c83e/wdoom"
+    needs:
+      - "gate"
+    when:
+      events:
+        - "push"
+    publish:
+      promote_from: "pull_request"
